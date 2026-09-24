@@ -11,24 +11,58 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ==========================================
+      # Checkout repository
+      # ==========================================
       - name: Checkout
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.MY_PAT_TOKEN }}
 
+
+      # ==========================================
+      # Cache Python packages + Playwright browser
+      # ==========================================
+      - name: Cache Python and Playwright
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: ${{ runner.os }}-js-redirect-tools-v1
+          restore-keys: |
+            ${{ runner.os }}-js-redirect-tools-
+
+
+      # ==========================================
+      # Setup Python tools
+      # ==========================================
       - name: Setup Tools
         run: |
           python -m pip install --upgrade pip
-          pip install playwright requests
+
+          pip install \
+            --cache-dir ~/.cache/pip \
+            playwright \
+            requests
+
           python -m playwright install --with-deps chromium
+
           chmod +x tools/js_redirect_tester.py
 
+
+      # ==========================================
+      # Process URLs
+      # ==========================================
       - name: Process Task
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
         run: |
 
-          # === Run JS Redirect Tester ===
+          # ======================================
+          # Run JS Redirect Tester
+          # ======================================
           if [ -s data/usefull-path-urls-1.txt ]; then
 
             python tools/js_redirect_tester.py \
@@ -36,13 +70,20 @@ jobs:
               -p data/fuzz-params-list.txt \
               -o js_redirect_vulnerable.txt
 
-            # === Clear all scanned routes after successful scan ===
+            # ==================================
+            # Clear scanned routes ONLY after
+            # successful scanner completion
+            # ==================================
             : > data/usefull-path-urls-1.txt
 
+          else
+            echo "[+] No URLs to scan."
           fi
 
 
-          # === Commit updated files ===
+          # ======================================
+          # Commit updated files
+          # ======================================
           git config --global user.name "system"
           git config --global user.email "system@noreply.github.com"
 
@@ -52,6 +93,15 @@ jobs:
           git add js_redirect_vulnerable.txt
 
           if ! git diff --cached --quiet; then
-            git commit -m "chore: sync redirect tester" -q
+
+            git commit \
+              -m "chore: sync redirect tester" \
+              -q
+
             git push origin main -q
+
+          else
+
+            echo "[+] No changes to commit."
+
           fi
