@@ -1,6 +1,0 @@
-https://cruises.priceline.com/
-https://cruises.priceline.com/accessibility.do
-https://cruises.priceline.com/address_book/address_book_add.asp
-https://cruises.priceline.com/agespecific.do
-https://cruises.priceline.com/ajaxjson/filterdynamic.do
-https://cruises.priceline.com/b/c/sail.do
