@@ -1,0 +1,6 @@
+https://directory-v3-live.cb.dev/Ajax/CrossApplicationTracing/Header/Seen
+https://directory-v3-live.cb.dev/API/
+https://directory-v3-live.cb.dev/app-list/trending
+https://directory-v3-live.cb.dev/apps/00edb566-dream-goals
+https://directory-v3-live.cb.dev/
+https://directory-v3-live.cb.dev/browser/blobs
