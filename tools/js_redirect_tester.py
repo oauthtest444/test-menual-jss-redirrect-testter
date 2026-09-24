@@ -11,9 +11,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 
 PAYLOAD = "https://evil.com/"
-DEFAULT_DELAY = 1.0
-DEFAULT_TIMEOUT = 20_000
 DEFAULT_BATCH_SIZE = 100
+DEFAULT_TIMEOUT = 20000
+DEFAULT_DELAY = 1.0
+
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,116 +24,147 @@ USER_AGENT = (
 
 
 def load_urls(path):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return [
-            line.strip()
-            for line in f
-            if line.strip().startswith(("http://", "https://"))
-        ]
+    """Load HTTP/HTTPS URLs without modifying their paths."""
+
+    urls = []
+
+    with open(
+        path,
+        "r",
+        encoding="utf-8",
+        errors="ignore",
+    ) as f:
+
+        for line in f:
+            url = line.strip()
+
+            if not url:
+                continue
+
+            if url.startswith("http://") or url.startswith("https://"):
+                urls.append(url)
+
+    return urls
 
 
-def load_parameter_names(path):
+def load_parameters(path):
     """
-    Read ONLY parameters supplied in data/fuzz-params-list.txt.
+    Load ONLY parameter names from fuzz-params-list.txt.
 
-    Supported formats:
+    Supported:
 
-        url
-        redirect
         next
+        redirect
+        url
 
-    or:
+    and:
 
-        ?url=test&redirect=test&next=test
+        ?next=test&redirect=test&url=test
 
-    Parameters are NOT discovered from:
-      - JSON bodies
-      - POST bodies
-      - HTML
-      - JavaScript
-      - target responses
+    No parameters are extracted from target responses,
+    JSON bodies, POST bodies, HTML, or JavaScript.
     """
 
-    names = []
+    parameters = []
     seen = set()
 
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        content = f.read()
+    with open(
+        path,
+        "r",
+        encoding="utf-8",
+        errors="ignore",
+    ) as f:
 
-    for line in content.splitlines():
-        line = line.strip()
+        for line in f:
 
-        if not line:
-            continue
+            line = line.strip()
 
-        if line.startswith("?"):
-            line = line[1:]
+            if not line:
+                continue
 
-        # Query-string style:
-        # url=test&redirect=test&next=test
-        if "=" in line or "&" in line:
-            for key, _ in parse_qsl(
-                line,
-                keep_blank_values=True
-            ):
-                key = key.strip()
+            if line.startswith("?"):
+                line = line[1:]
 
-                if key and key not in seen:
-                    seen.add(key)
-                    names.append(key)
+            # Query-string style.
+            if "=" in line or "&" in line:
 
-        # One parameter name per line.
-        else:
-            key = line.strip()
+                for name, _ in parse_qsl(
+                    line,
+                    keep_blank_values=True,
+                ):
 
-            if key and key not in seen:
-                seen.add(key)
-                names.append(key)
+                    name = name.strip()
 
-    return names
+                    if name and name not in seen:
+                        seen.add(name)
+                        parameters.append(name)
+
+            else:
+
+                name = line.strip()
+
+                if name and name not in seen:
+                    seen.add(name)
+                    parameters.append(name)
+
+    return parameters
 
 
-def build_test_url(base_url, parameter_names):
+def build_test_url(base_url, parameters):
     """
-    Keep the original URL/path and existing parameters.
+    Modify ONLY the query string.
 
-    Parameters from fuzz-params-list.txt are added/overwritten
-    with https://evil.com/
+    The original scheme, hostname, path and fragment
+    remain unchanged.
+
+    Example:
+
+        https://example.com/a/b
+
+    becomes:
+
+        https://example.com/a/b?next=https%3A%2F%2Fevil.com%2F
+
+    Never:
+
+        https://example.com/a/https:/evil.com/
     """
 
     parts = urlsplit(base_url)
 
-    existing = parse_qsl(
+    original_query = parse_qsl(
         parts.query,
-        keep_blank_values=True
+        keep_blank_values=True,
     )
 
-    fuzz_parameter_set = set(parameter_names)
+    tested_names = set(parameters)
 
-    # Keep existing parameters which are not being fuzzed.
-    kept = [
-        (key, value)
-        for key, value in existing
-        if key not in fuzz_parameter_set
+    # Preserve existing parameters that are not being tested.
+    preserved = [
+        (name, value)
+        for name, value in original_query
+        if name not in tested_names
     ]
 
-    # Add ONLY parameters from fuzz-params-list.txt.
-    fuzzed = [
+    # ONLY parameters from fuzz-params-list.txt receive the payload.
+    injected = [
         (name, PAYLOAD)
-        for name in parameter_names
+        for name in parameters
     ]
 
-    query = urlencode(
-        kept + fuzzed,
-        doseq=True
+    new_query = urlencode(
+        preserved + injected,
+        doseq=True,
     )
 
+    # IMPORTANT:
+    # parts.path is used unchanged.
     return urlunsplit(
         (
             parts.scheme,
             parts.netloc,
             parts.path,
-            query,
+            new_query,
             parts.fragment,
         )
     )
@@ -140,30 +172,48 @@ def build_test_url(base_url, parameter_names):
 
 def is_confirmed_redirect(original_url, final_url):
     """
-    Confirm only when the browser finally reaches:
+    Confirm only a real cross-origin redirect to evil.com.
+
+    Examples:
 
         https://evil.com/
+        https://evil.com/test
+        https://evil.com/?x=1
 
-    or another path/query on evil.com.
+    are confirmed.
+
+    This is NOT confirmed:
+
+        https://chaturbate.com/v2apps/apps/https:/evil.com/
+
+    because the final hostname is still chaturbate.com.
     """
 
     try:
+
         original = urlsplit(original_url)
         final = urlsplit(final_url)
+
+        final_hostname = (
+            final.hostname.lower()
+            if final.hostname
+            else ""
+        )
+
+        original_hostname = (
+            original.hostname.lower()
+            if original.hostname
+            else ""
+        )
 
         if final.scheme.lower() != "https":
             return False
 
-        if not final.hostname:
+        if final_hostname != "evil.com":
             return False
 
-        if final.hostname.lower() != "evil.com":
+        if final_hostname == original_hostname:
             return False
-
-        # Make sure this is cross-origin.
-        if original.hostname:
-            if final.hostname.lower() == original.hostname.lower():
-                return False
 
         return True
 
@@ -171,17 +221,19 @@ def is_confirmed_redirect(original_url, final_url):
         return False
 
 
-def send_to_discord(
-    webhook_url,
+def send_discord(
+    webhook,
     base_url,
     test_url,
     final_url,
-    params,
+    parameters,
 ):
-    if not webhook_url:
+    """Send confirmed findings to Discord."""
+
+    if not webhook:
         print(
-            "    ⚠️ DISCORD_WEBHOOK_URL is not configured; "
-            "notification skipped."
+            "       ⚠️ "
+            "DISCORD_WEBHOOK_URL is not configured."
         )
         return
 
@@ -189,41 +241,98 @@ def send_to_discord(
         "content": "🔴 **JS Redirect Vulnerability Confirmed**",
         "embeds": [
             {
-                "title": "Open Redirect / JS Redirect",
+                "title": "Confirmed Redirect",
                 "description": (
-                    f"**Base URL:** {base_url}\n"
-                    f"**Test URL:** {test_url}\n"
-                    f"**Final URL:** {final_url}\n"
-                    f"**Parameters:** {', '.join(params[:100])}\n"
-                    f"**Payload:** {PAYLOAD}"
+                    f"**Original URL:**\n"
+                    f"{base_url}\n\n"
+                    f"**Test URL:**\n"
+                    f"{test_url}\n\n"
+                    f"**Final URL:**\n"
+                    f"{final_url}\n\n"
+                    f"**Parameters:**\n"
+                    f"{', '.join(parameters)}\n\n"
+                    f"**Payload:**\n"
+                    f"{PAYLOAD}"
                 ),
             }
         ],
     }
 
     try:
+
         response = requests.post(
-            webhook_url,
+            webhook,
             json=message,
             timeout=10,
         )
 
         response.raise_for_status()
 
-        print("    📣 Discord notification sent.")
+        print(
+            "       📣 Discord notification sent."
+        )
 
     except Exception as exc:
+
         print(
-            f"    ⚠️ Discord notification failed: {exc}"
+            "       ⚠️ Discord notification failed: "
+            f"{exc}"
         )
+
+
+def scan_page(
+    page,
+    base_url,
+    parameters,
+    timeout,
+):
+    """Navigate to one generated URL and return final URL."""
+
+    test_url = build_test_url(
+        base_url,
+        parameters,
+    )
+
+    try:
+
+        page.goto(
+            test_url,
+            wait_until="domcontentloaded",
+            timeout=timeout,
+        )
+
+        # Allow client-side redirects to execute.
+        page.wait_for_timeout(1500)
+
+        # IMPORTANT:
+        # page.url is a string property in Playwright Python.
+        final_url = page.url
+
+        return test_url, final_url
+
+    except PlaywrightTimeoutError:
+
+        # Even when navigation times out, the page may have
+        # already redirected somewhere useful.
+        final_url = page.url
+
+        return test_url, final_url
+
+    except Exception as exc:
+
+        print(
+            f"       ⚠️ Navigation error: {exc}"
+        )
+
+        return test_url, None
 
 
 def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Test JavaScript/open redirects using "
-            "batched fuzz parameters."
+            "Test supplied query parameters for "
+            "JavaScript/open redirects."
         )
     )
 
@@ -231,37 +340,21 @@ def main():
         "-l",
         "--list",
         required=True,
-        help="Input URL list",
+        help="URL list",
     )
 
     parser.add_argument(
         "-p",
         "--params",
         required=True,
-        help="Fuzz parameter list",
+        help="Parameter list",
     )
 
     parser.add_argument(
         "-o",
         "--output",
         default="js_redirect_vulnerable.txt",
-        help="Output file",
-    )
-
-    parser.add_argument(
-        "-d",
-        "--delay",
-        type=float,
-        default=DEFAULT_DELAY,
-        help="Delay between requests in seconds",
-    )
-
-    parser.add_argument(
-        "-t",
-        "--timeout",
-        type=int,
-        default=DEFAULT_TIMEOUT,
-        help="Navigation timeout in milliseconds",
+        help="Output findings file",
     )
 
     parser.add_argument(
@@ -271,51 +364,67 @@ def main():
         help="Parameters per request. Default: 100",
     )
 
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help="Browser navigation timeout in milliseconds",
+    )
+
+    parser.add_argument(
+        "-d",
+        "--delay",
+        type=float,
+        default=DEFAULT_DELAY,
+        help="Delay between requests",
+    )
+
     args = parser.parse_args()
 
-    if args.batch_size <= 0:
-        parser.error(
-            "--batch-size must be greater than 0"
-        )
-
-    if not os.path.isfile(args.list):
+    if args.batch_size < 1:
         print(
-            f"[-] URL list not found: {args.list}"
+            "[-] Batch size must be greater than 0."
         )
         return 1
 
+    if not os.path.isfile(args.list):
+
+        print(
+            f"[-] URL list not found: {args.list}"
+        )
+
+        return 1
+
     if not os.path.isfile(args.params):
+
         print(
             f"[-] Parameter list not found: {args.params}"
         )
+
         return 1
 
     urls = load_urls(args.list)
 
-    parameters = load_parameter_names(
-        args.params
-    )
+    parameters = load_parameters(args.params)
 
     if not urls:
-        print("[-] No HTTP/HTTPS URLs found.")
+
+        print(
+            "[-] No HTTP/HTTPS URLs found."
+        )
+
         return 0
 
     if not parameters:
+
         print(
-            "[-] No parameters found in fuzz list."
+            "[-] No parameters found."
         )
+
         return 1
 
-    # Split parameters into batches.
-    #
-    # Example:
-    #
-    # 250 parameters:
-    #
-    # 100
-    # 100
-    # 50
-
+    # Split ONLY the supplied fuzz parameters.
     batches = [
         parameters[i:i + args.batch_size]
         for i in range(
@@ -325,32 +434,40 @@ def main():
         )
     ]
 
-    webhook_url = os.environ.get(
+    webhook = os.environ.get(
         "DISCORD_WEBHOOK_URL",
-        ""
+        "",
     ).strip()
 
     print()
-    print("[+] JS Redirect Tester")
+    print(
+        "[+] JS Redirect Tester"
+    )
+
     print(
         f"[+] URLs        : {len(urls)}"
     )
+
     print(
         f"[+] Parameters  : {len(parameters)}"
     )
+
     print(
         f"[+] Batch size  : {args.batch_size}"
     )
+
     print(
         f"[+] Requests/URL: {len(batches)}"
     )
+
     print(
         f"[+] Payload     : {PAYLOAD}"
     )
+
     print()
 
     findings = []
-    seen_findings = set()
+    finding_keys = set()
 
     with sync_playwright() as playwright:
 
@@ -363,20 +480,20 @@ def main():
         )
 
         context = browser.new_context(
-            user_agent=USER_AGENT
+            user_agent=USER_AGENT,
         )
 
         page = context.new_page()
 
         try:
 
-            for url_index, base_url in enumerate(
+            for index, base_url in enumerate(
                 urls,
                 1,
             ):
 
                 print(
-                    f"[{url_index}/{len(urls)}] "
+                    f"[{index}/{len(urls)}] "
                     f"{base_url}"
                 )
 
@@ -385,108 +502,73 @@ def main():
                     1,
                 ):
 
-                    test_url = build_test_url(
-                        base_url,
-                        batch,
-                    )
-
                     print(
                         f"    → Batch "
                         f"{batch_index}/{len(batches)} "
                         f"({len(batch)} parameters)"
                     )
 
-                    final_url = test_url
+                    test_url, final_url = scan_page(
+                        page,
+                        base_url,
+                        batch,
+                        args.timeout,
+                    )
 
-                    try:
-
-                        page.goto(
-                            test_url,
-                            wait_until="domcontentloaded",
-                            timeout=args.timeout,
-                        )
-
-                        # Give client-side JavaScript redirects
-                        # time to execute.
-                        page.wait_for_timeout(
-                            1000
-                        )
-
-                        # IMPORTANT:
-                        # Playwright Python exposes page.url
-                        # as a string property, NOT page.url().
-                        final_url = page.url
-
-                    except PlaywrightTimeoutError:
-
-                        # Even after a navigation timeout, the
-                        # browser may already have redirected.
-                        final_url = page.url
-
-                    except Exception as exc:
-
-                        print(
-                            f"       ⚠️ Navigation error: "
-                            f"{exc}"
-                        )
-
-                        time.sleep(
-                            max(args.delay, 0)
-                        )
-
+                    if final_url is None:
                         continue
 
-                    # Check whether browser ended at evil.com.
+                    # Show final browser URL.
+                    print(
+                        f"       ✓ Final URL: "
+                        f"{final_url}"
+                    )
+
+                    # Confirm ONLY actual evil.com navigation.
                     if is_confirmed_redirect(
                         base_url,
                         final_url,
                     ):
 
-                        finding_key = (
+                        key = (
                             base_url,
                             final_url,
                             tuple(batch),
                         )
 
-                        if finding_key not in seen_findings:
+                        if key in finding_keys:
+                            continue
 
-                            seen_findings.add(
-                                finding_key
-                            )
+                        finding_keys.add(key)
 
-                            findings.append(
-                                {
-                                    "base_url": base_url,
-                                    "test_url": test_url,
-                                    "final_url": final_url,
-                                    "parameters": batch,
-                                }
-                            )
-
-                            print()
-                            print(
-                                "       🔴 "
-                                "CONFIRMED REDIRECT!"
-                            )
-
-                            print(
-                                f"       Final URL: "
-                                f"{final_url}"
-                            )
-
-                            send_to_discord(
-                                webhook_url,
-                                base_url,
-                                test_url,
-                                final_url,
-                                batch,
-                            )
-
-                    else:
+                        print()
+                        print(
+                            "       🔴 "
+                            "CONFIRMED REDIRECT!"
+                        )
 
                         print(
-                            f"       ✓ Final URL: "
+                            f"       Final URL: "
                             f"{final_url}"
+                        )
+
+                        finding = {
+                            "base_url": base_url,
+                            "test_url": test_url,
+                            "final_url": final_url,
+                            "parameters": batch,
+                        }
+
+                        findings.append(
+                            finding
+                        )
+
+                        send_discord(
+                            webhook,
+                            base_url,
+                            test_url,
+                            final_url,
+                            batch,
                         )
 
                     time.sleep(
@@ -497,29 +579,35 @@ def main():
 
             browser.close()
 
-    # Save confirmed findings.
+    # Write findings.
     with open(
         args.output,
         "w",
         encoding="utf-8",
-    ) as out:
+    ) as output:
 
         for finding in findings:
 
-            out.write(
-                f"URL: {finding['test_url']}\n"
+            output.write(
+                f"Original URL: "
+                f"{finding['base_url']}\n"
             )
 
-            out.write(
+            output.write(
+                f"Test URL: "
+                f"{finding['test_url']}\n"
+            )
+
+            output.write(
                 "JS REDIRECT VULNERABLE!\n"
             )
 
-            out.write(
+            output.write(
                 f"Final URL: "
                 f"{finding['final_url']}\n"
             )
 
-            out.write(
+            output.write(
                 "Parameters: "
                 + ", ".join(
                     finding["parameters"]
@@ -527,16 +615,24 @@ def main():
                 + "\n"
             )
 
-            out.write(
-                "---\n"
+            output.write(
+                f"Payload: {PAYLOAD}\n"
+            )
+
+            output.write(
+                "----------------------------------------\n"
             )
 
     print()
-    print("[+] Scan completed.")
+    print(
+        "[+] Scan completed."
+    )
+
     print(
         f"[+] Confirmed findings: "
         f"{len(findings)}"
     )
+
     print(
         f"[+] Results saved to: "
         f"{args.output}"
